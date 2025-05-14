@@ -32,6 +32,7 @@ from kblam.kb_encoder import KBEncoder
 from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
+from kblam.models.gemma3_model import KBLaMGemma3ForCausalLM
 from kblam.utils.data_utils import (
     augment_row,
     generate_multi_entity_qa,
@@ -85,7 +86,7 @@ parser.add_argument("--use_data_aug", action="store_true", help="Randomly pick t
 parser.add_argument("--use_lr_decay", action="store_true")
 parser.add_argument("--dataset_dir", type=str, default="synthetic_data")
 parser.add_argument("--model_dir_to_resume", type=str, default=None, help="Checkpoint directory to resume training")
-parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct", choices=["meta-llama/Meta-Llama-3-8B", "microsoft/Phi-3-mini-4k-instruct", "meta-llama/Llama-3.2-1B-Instruct"])
+parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct", choices=["meta-llama/Meta-Llama-3-8B", "microsoft/Phi-3-mini-4k-instruct", "meta-llama/Llama-3.2-1B-Instruct", "google/gemma-3b", "google/gemma-7b"])
 parser.add_argument("--hf_token", type=str,default=None,help="Huggingface token")
 parser.add_argument("--model_save_dir", type=str, default="output", help="Place to save the checkpoints")
 parser.add_argument("--kb_size", type=int, default=None, help="The size of the KB set size")
@@ -99,7 +100,7 @@ parser.add_argument("--kb_token_layer_frequency", type=int, default=3, help="Int
 parser.add_argument("--gradient_accm_step", type=int, default=20, help="Introduce QA with extended open-ended parts")
 parser.add_argument("--verbose", action="store_true", help="Set logging to debug")
 parser.add_argument("--log_to_file", action="store_true", help="Log to file as well as stdout")
-parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3"])
+parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3", "gemma3"])
 parser.add_argument("--max_seq_len",type=int,default=None)
 # fmt: on
 
@@ -163,6 +164,10 @@ def _format_QA_phi3(Q: str, A: str):
     return "<|user|>\n" + Q + "<|end|>\n" + "<|assistant|>\n" + A + "<|end|>\n"
 
 
+def _format_QA_gemma3(Q: str, A: str):
+    return "<start_of_turn>user\n" + Q + "<end_of_turn>\n<start_of_turn>model\n" + A + "<end_of_turn>\n"
+
+
 def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tokenizer):
     # Not sure this is correct. This method simply masks the <|start_header_id|>user<|end_header_id|> then leaves the rest in the labels
     # Possibly what they want is to mask out the query. To do that swap the index from the tokenizer below from 1 to 2
@@ -183,6 +188,21 @@ def _create_labels_for_phi3(input_ids: torch.Tensor, input_strs: List[str], toke
     # Not 100% this is correct
     answer_indices = torch.argmax(
         (input_ids == tokenizer("<|user|>")["input_ids"][0]).long(),
+        -1,
+    )
+    answer_mask = torch.ones_like(input_ids)
+    for b in range(len(input_strs)):
+        answer_mask[b, : (answer_indices[b].item() + 1)] = 0
+    labels = input_ids * answer_mask + (1 - answer_mask) * (-100)
+    return labels
+
+
+def _create_labels_for_gemma3(input_ids: torch.Tensor, input_strs: List[str], tokenizer):
+    # Gemma3 모델용 레이블 생성
+    # 사용자 입력을 마스킹하고 모델 응답만 학습하도록 함
+    model_token_id = tokenizer("<start_of_turn>model", add_special_tokens=False)["input_ids"][0]
+    answer_indices = torch.argmax(
+        (input_ids == model_token_id).long(),
         -1,
     )
     answer_mask = torch.ones_like(input_ids)
@@ -880,6 +900,16 @@ def main():
     )
     tokenizer.pad_token = tokenizer.eos_token
 
+    # KB 설정 준비
+    kb_config = None
+    if model_dir_to_resume:
+        kb_config = KBLaMConfig.from_pretrained(os.path.join(model_dir_to_resume, "kb_config.json"))
+    else:
+        kb_config = KBLaMConfig(
+            sep_query_head=sep_query_head,
+            kb_layer_frequency=kb_token_layer_frequency,
+        )
+
     if args.llm_type == "llama3":
         model = KblamLlamaForCausalLM.from_pretrained(
             llm_model_spec,
@@ -887,16 +917,32 @@ def main():
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             token=hf_token,
+            kb_config=kb_config,
         )
+        format_QA = _format_QA_llama
+        create_labels = _create_labels_for_llama
     elif args.llm_type == "phi3":
         model = KBLaMPhi3ForCausalLM.from_pretrained(
             llm_model_spec,
             device_map=device,
             torch_dtype="auto",
             trust_remote_code=True,
+            kb_config=kb_config,
         )
+        format_QA = _format_QA_phi3
+        create_labels = _create_labels_for_phi3
+    elif args.llm_type == "gemma3":
+        model = KBLaMGemma3ForCausalLM.from_pretrained(
+            llm_model_spec,
+            device_map=device,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            kb_config=kb_config,
+        )
+        format_QA = _format_QA_gemma3
+        create_labels = _create_labels_for_gemma3
     else:
-        ValueError(f"LLM type {args.llm_type} not recognised")
+        raise ValueError(f"LLM type {args.llm_type} not recognised")
 
     logger.info(model.config)  # type: ignore
 
@@ -918,20 +964,14 @@ def main():
 
     if model_dir_to_resume:
         encoder.load_state_dict(torch.load(os.path.join(model_dir_to_resume, "encoder.pt")))
-        kb_config = KBLaMConfig.from_pretrained(os.path.join(model_dir_to_resume, "kb_config.json"))
-    else:
-        kb_config = KBLaMConfig(
-            sep_query_head=sep_query_head,
-            kb_layer_frequency=kb_token_layer_frequency,
-        )
 
     encoder.train()
 
     kbretriever = KBRetriever(
         encoder,
         training_set,
-        key_embds=key_embds,  # type: ignore
-        value_embds=value_embds,  # type: ignore
+        key_embds=key_embds if use_cached_embd else None,  # type: ignore
+        value_embds=value_embds if use_cached_embd else None,  # type: ignore
     )
 
     logger.info("Model ready 🚀")
@@ -955,17 +995,14 @@ def main():
         max_seq_len=max_seq_len,
     )
 
-    logger.info(f"Number of trainable parameters: {_get_parameter_count(encoder):,}")
-
     trainer.train(
         training_set,
         B,
         gradient_accm_step,
         outlier_num,
-        use_data_aug=use_data_aug,
-        multi_entities=multi_entities,
-        use_extended_qa=use_extended_qa,
-        save_period=3000,
+        use_data_aug,
+        multi_entities,
+        use_extended_qa,
         resumed_step=resumed_step,
         kb_config=kb_config,
     )

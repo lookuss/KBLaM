@@ -20,6 +20,7 @@ from kblam.kb_encoder import KBEncoder
 from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
+from kblam.models.gemma3_model import KBLaMGemma3ForCausalLM
 from kblam.utils.data_utils import aug_row, generate_multi_entity_qa
 from kblam.utils.eval_utils import (
     instruction_prompts,
@@ -39,6 +40,15 @@ logging.set_verbosity_warning()
 
 rouge = evaluate.load("rouge")
 bert_score = evaluate.load("bertscore")
+
+# Gemma3 모델용 질문 포맷팅 함수 추가
+def _format_Q_gemma3(Q: str):
+    return "<start_of_turn>user\n" + Q + "<end_of_turn>\n<start_of_turn>model\n"
+
+# 모델 유형별 포맷팅 함수 매핑 업데이트
+model_prune_format_mapping.update({
+    "gemma3": _format_Q_gemma3
+})
 
 
 class KBRetriever:
@@ -342,7 +352,7 @@ parent_parser.add_argument(
     "--llm_type",
     type=str,
     default="phi3",
-    choices=["llama3", "phi3"],
+    choices=["llama3", "phi3", "gemma3"],
     help="Type of language model to use",
 )
 parent_parser.add_argument(
@@ -620,61 +630,74 @@ def _prepare_models(
     kb_layer_frequency,
     kb_scale_factor,
 ):
-    tokenizer = AutoTokenizer.from_pretrained(
-        llm_base_dir, trust_remote_code=True, padding_side="left"
-    )
-    tokenizer.pad_token = "^"
-
-    if llm_type == "llama3":
-        if query_head_path:
-            model = KblamLlamaForCausalLM.from_pretrained(
-                model_path,
-                device_map="cuda",
-                torch_dtype="auto",
-                trust_remote_code=True,
-            )
-            model.load_query_head(query_head_path)
-        else:
-            model = KblamLlamaForCausalLM.from_pretrained(
-                model_path,
-                device_map="cuda",
-                torch_dtype="auto",
-                trust_remote_code=True,
-            )
+    # initialize the model
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model path {model_path} does not exist")
+    
+    # KB 설정 준비
+    kb_config_path = os.path.join(model_path, "kb_config_explicit.json")
+    if os.path.exists(kb_config_path):
+        kb_config = KBLaMConfig.from_json_file(kb_config_path)
     else:
-        model = KBLaMPhi3ForCausalLM.from_pretrained(
-            model_path,
+        kb_config = KBLaMConfig(kb_layer_frequency=kb_layer_frequency)
+    
+    # 모델 불러오기
+    if llm_type == "llama3":
+        model = KblamLlamaForCausalLM.from_pretrained(
+            llm_base_dir,
+            cache_dir=None,
+            torch_dtype=torch.bfloat16,
             device_map="cuda",
-            torch_dtype="auto",
-            trust_remote_code=True,
+            kb_config=kb_config,
         )
-    model.generation_config.pad_token_id = tokenizer.pad_token_id
-    model.generation_config.eos_token_id = tokenizer.eos_token_id
-    model.eval()
+    elif llm_type == "phi3":
+        model = KBLaMPhi3ForCausalLM.from_pretrained(
+            llm_base_dir,
+            cache_dir=None,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+            kb_config=kb_config,
+        )
+    elif llm_type == "gemma3":
+        model = KBLaMGemma3ForCausalLM.from_pretrained(
+            llm_base_dir,
+            cache_dir=None,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+            kb_config=kb_config,
+        )
+    else:
+        raise ValueError(f"LLM type {llm_type} not recognised")
 
-    # config = model.config.to_dict()
-    kb_config = KBLaMConfig(
-        sep_query_head=True,
-        kb_layer_frequency=kb_layer_frequency,
-        kb_scale_factor=kb_scale_factor,
-    )
-    # config.update(kb_config.to_dict())
-    # new_config = KBLaMConfig(**config)
-    # model.config = new_config
+    tokenizer = AutoTokenizer.from_pretrained(llm_base_dir)
+    tokenizer.pad_token = tokenizer.eos_token
 
+    # 인코더 설정
     encoder = KBEncoder(
-        encoder_name=encoder_spec.upper(),
+        encoder_name=encoder_spec,
         projector_type="linear",
         endpoint_url="",
         out_dim=model.config.hidden_size
-        * (model.config.num_hidden_layers // kb_layer_frequency + 1),
+        * (model.config.num_hidden_layers // kb_config.kb_layer_frequency + 1),
         frozen_base_model=True,
-        projector_kwargs={"mlp_depth": 1, "mlp_hidden_dim": 512},
-        device=torch.device("cuda"),
+        device="cuda",
     )
 
-    encoder.load_state_dict(torch.load(encoder_path))
-    return tokenizer, encoder, model, kb_config
+    # 인코더 로드
+    if encoder_path and os.path.exists(encoder_path):
+        encoder.load_state_dict(torch.load(encoder_path))
+    else:
+        print(f"⚠️ Warning: encoder path {encoder_path} does not exist")
+
+    if query_head_path:
+        query_head_state_dict = torch.load(query_head_path)
+        model.kb_query_head.load_state_dict(query_head_state_dict)
+
+    # KB 스케일 팩터 설정
+    kb_config.kb_scale_factor = kb_scale_factor
+    model.kb_config = kb_config
+
+    return model, tokenizer, encoder, kb_config
 
 
 def eval_accuracy(

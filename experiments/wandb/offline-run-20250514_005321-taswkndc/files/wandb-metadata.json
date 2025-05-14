@@ -1,0 +1,31 @@
+{
+  "os": "macOS-15.4.1-arm64-arm-64bit",
+  "python": "CPython 3.10.16",
+  "startedAt": "2025-05-13T15:53:21.946643Z",
+  "args": [
+    "--dataset",
+    "synthetic_data",
+    "--N",
+    "120000",
+    "--B",
+    "20",
+    "--total_steps",
+    "50",
+    "--encoder_spec",
+    "OAI",
+    "--use_oai_embd",
+    "--key_embd_src",
+    "key",
+    "--use_data_aug"
+  ],
+  "program": "/Users/yugyeongmin/GitHub/KBLaM/experiments/train.py",
+  "codePath": "experiments/train.py",
+  "git": {
+    "remote": "https://github.com/microsoft/KBLaM.git",
+    "commit": "65262680386c5e0218928ed6dd7fcf4736fc8043"
+  },
+  "root": "/Users/yugyeongmin/GitHub/KBLaM/experiments",
+  "host": "MacBook-Pro.local",
+  "executable": "/Users/yugyeongmin/anaconda3/envs/kblam/bin/python",
+  "codePathLocal": "train.py"
+}
